@@ -33,7 +33,9 @@ func main() {
 	var err error
 	// cli, err = client.NewEnvClient()
 	// cli, err = client.NewClientWithOpts(client.FromEnv)
-	cli, err = client.NewClientWithOpts(client.WithVersion("1.36"))
+	// cli, err = client.NewClientWithOpts(client.WithVersion("1.36"))
+	//FromEnv picks up the default Docker socket, and WithAPIVersionNegotiation() lets the client automatically negotiate the highest supported API version with the daemon
+	cli, err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		panic(err)
 	}
