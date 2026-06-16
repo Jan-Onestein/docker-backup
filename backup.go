@@ -130,6 +130,14 @@ func backup(ID string) error {
 
 	paths = []string{}
 
+	// Add mount-path to filelist - start fix
+    for _, mount := range conf.Mounts {
+        if mount.Type == "bind" || mount.Type == "volume" {
+            paths = append(paths, mount.Source)
+        }
+    }
+    // end fix
+
 	conf.Config.Image, err = getFullImageName(conf.Config.Image)
 	if err != nil {
 		return err
