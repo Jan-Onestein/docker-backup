@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-docker_backup.py - Python re-implementatie van docker-backup (oorspronkelijk Go)
+docker_backup.py - Python re-implementation of docker-backup (originally Go)
 
-Maakt backups van Docker containers: metadata (json) + een kopie van alle
-volume-mounts, of optioneel een enkel .tar bestand. Kan een backup ook weer
-terugzetten (restore).
+Creates backups of Docker containers: metadata (json) + a copy of all
+volume mounts, or optionally a single .tar file. Can also restore a
+backup.
 
-Vereist: python3 en de `docker` CLI in PATH. Praat via subprocess met de
-Docker CLI -- geen extra pip-dependency nodig.
+Requires: python3 and the `docker` CLI in PATH. Talks to the Docker CLI
+via subprocess -- no extra pip dependency needed.
 
-Gebruik:
+Usage:
     ./docker_backup.py backup <container-id>
     ./docker_backup.py backup --all [--stopped]
     ./docker_backup.py backup <container-id> --tar
@@ -30,44 +30,43 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def run(cmd, capture=True, check=True):
-    """Voert een commando uit en geeft stdout terug (of gooit een RuntimeError)."""
+    """Runs a command and returns stdout (or raises a RuntimeError)."""
     result = subprocess.run(cmd, capture_output=capture, text=True)
     if check and result.returncode != 0:
-        raise RuntimeError(f"Commando mislukt: {' '.join(cmd)}\n{result.stderr.strip()}")
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stderr.strip()}")
     return result.stdout.strip() if capture else None
 
 
 def docker_inspect(ref):
-    """Geeft de volledige `docker inspect`-output terug als dict."""
+    """Returns the full `docker inspect` output as a dict."""
     out = run(["docker", "inspect", ref])
     data = json.loads(out)
     if not data:
-        raise RuntimeError(f"Kon container/image '{ref}' niet vinden.")
+        raise RuntimeError(f"Could not find container/image '{ref}'.")
     return data[0]
 
 
 def sanitize(name):
-    """Maakt een string veilig als bestands-/mapnaam."""
+    """Makes a string safe to use as a file/directory name."""
     name = name.strip("/")
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
 
 
 def mount_folder_name(mount):
-    """Submapnaam voor een mount: Docker volumenaam indien beschikbaar,
-    anders het gesanitized destination-pad (bind mount)."""
+    """Subdirectory name for a mount: Docker volume name if available,
+    otherwise the sanitized destination path (bind mount)."""
     if mount.get("Name"):
         return sanitize(mount["Name"])
     return sanitize(mount["Destination"])
 
 
 def get_full_image_name(image):
-    """Probeert een volledige image:tag te vinden als er geen tag is opgegeven."""
+    """Tries to find a full image:tag if no tag was specified."""
     if ":" in image:
         return image
     try:
@@ -114,10 +113,17 @@ def do_backup(container_id, args):
         if args.verbose:
             print(f"Mount ({m.get('Type')}) {src} -> {m['Destination']}")
 
+        # Some containers bind-mount special files instead of directories,
+        # e.g. /var/run/docker.sock (common for Portainer, Watchtower, Diun,
+        # Traefik, autoheal, etc.). shutil.copytree() requires a directory,
+        # so skip anything that isn't one instead of crashing the whole run.
+        if not os.path.isdir(src):
+            print(f"Warning: mount '{src}' is not a directory (socket/device?), skipping it.")
+            continue
+
         for root, _dirs, files in os.walk(src):
             for f in files:
                 collected_paths.append(os.path.join(root, f))
-
         dest_dir = backup_root / mount_folder_name(m)
         shutil.copytree(src, dest_dir, dirs_exist_ok=True)
 
@@ -152,6 +158,13 @@ def backup_tar(info, filename, backup_root, args):
             src = m["Source"]
             if args.verbose:
                 print(f"Mount ({m.get('Type')}) {src} -> {m['Destination']}")
+
+            # Same reasoning as in do_backup(): skip sockets/devices/missing
+            # paths instead of letting tarfile blow up on a non-regular file.
+            if not os.path.exists(src):
+                print(f"Warning: mount '{src}' does not exist, skipping it.")
+                continue
+
             tf.add(src, arcname=src.lstrip("/"))
 
     print(f"Created backup: {tar_path}")
@@ -163,16 +176,15 @@ def backup_tar(info, filename, backup_root, args):
 # ---------------------------------------------------------------------------
 
 def create_container_from_info(info, args):
-    """Maakt een nieuwe container op basis van de opgeslagen `docker inspect`
-    metadata. Poort-mappings, environment, entrypoint, cmd, working-dir en
-    labels worden hersteld.
+    """Creates a new container based on the stored `docker inspect`
+    metadata. Port mappings, environment, entrypoint, cmd, working dir and
+    labels are restored.
 
-    Let op (zelfde beperking als de originele Go-tool): mounts worden niet
-    1-op-1 als bind-mount teruggezet. Alleen volumes die al in de image zelf
-    gedefinieerd staan (VOLUME-instructie) worden automatisch door Docker
-    aangemaakt -- de data daarvoor wordt na het aanmaken teruggekopieerd.
-    Overige bind-mounts moet je zelf opnieuw toevoegen (zie waarschuwingen
-    tijdens restore)."""
+    Note (same limitation as the original Go tool): mounts are not
+    restored 1-to-1 as bind mounts. Only volumes already defined in the
+    image itself (VOLUME instruction) are automatically created by
+    Docker -- the data for those is copied back afterwards. Other bind
+    mounts need to be added back manually (see warnings during restore)."""
     config = info["Config"]
     host_config = info.get("HostConfig", {})
     name = info["Name"].lstrip("/")
@@ -221,7 +233,7 @@ def create_container_from_info(info, args):
 
 
 def match_new_mounts(old_mounts, new_info):
-    """Koppelt oude mounts aan nieuwe mounts op basis van Destination."""
+    """Maps old mounts to new mounts based on Destination."""
     new_mounts = new_info.get("Mounts", [])
     mapping = {}
     for old in old_mounts:
@@ -239,7 +251,7 @@ def do_restore(backup_file, args):
         return restore_from_info(info, path.parent, args)
     if path.suffix == ".tar":
         return restore_tar(path, args)
-    raise RuntimeError("Onbekend bestandstype, geef een .json of .tar bestand op")
+    raise RuntimeError("Unknown file type, please provide a .json or .tar file")
 
 
 def restore_from_info(info, backup_dir, args):
@@ -253,12 +265,13 @@ def restore_from_info(info, backup_dir, args):
         src_data = backup_dir / mount_folder_name(old)
 
         if not new:
-            print(f"Waarschuwing: geen automatisch aangemaakte mount voor "
-                  f"{old['Destination']} -- data in '{src_data}' moet je zelf "
-                  f"terugzetten (bv. handmatig bind-mounten).")
+            print(f"Warning: no automatically created mount for "
+                  f"{old['Destination']} -- data in '{src_data}' must be "
+                  f"restored manually (e.g. bind-mount it yourself).")
             continue
+
         if not src_data.exists():
-            print(f"Waarschuwing: geen backupdata gevonden in {src_data}, sla over.")
+            print(f"Warning: no backup data found in {src_data}, skipping.")
             continue
 
         print(f"Restoring: {src_data} -> {new['Source']}")
@@ -266,6 +279,7 @@ def restore_from_info(info, backup_dir, args):
 
     if args.start:
         start_container(new_id)
+
     return new_id
 
 
@@ -273,7 +287,6 @@ def restore_tar(tar_path, args):
     with tarfile.open(tar_path, "r") as tf:
         info = json.loads(tf.extractfile("container.json").read())
         old_mounts = info.get("Mounts", [])
-
         new_id = create_container_from_info(info, args)
         new_info = docker_inspect(new_id)
         mapping = match_new_mounts(old_mounts, new_info)
@@ -286,12 +299,13 @@ def restore_tar(tar_path, args):
                 extracted = Path(tmp) / old["Source"].lstrip("/")
 
                 if not new:
-                    print(f"Waarschuwing: geen automatisch aangemaakte mount voor "
-                          f"{old['Destination']} -- data in '{extracted}' moet je "
-                          f"zelf terugzetten.")
+                    print(f"Warning: no automatically created mount for "
+                          f"{old['Destination']} -- data in '{extracted}' "
+                          f"must be restored manually.")
                     continue
+
                 if not extracted.exists():
-                    print(f"Waarschuwing: geen data gevonden voor {old['Destination']} in tar, sla over.")
+                    print(f"Warning: no data found for {old['Destination']} in tar, skipping.")
                     continue
 
                 print(f"Restoring: {extracted} -> {new['Source']}")
@@ -299,6 +313,7 @@ def restore_tar(tar_path, args):
 
     if args.start:
         start_container(new_id)
+
     return new_id
 
 
@@ -315,18 +330,18 @@ def main():
     parser = argparse.ArgumentParser(description="Backup & restore Docker containers")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    b = sub.add_parser("backup", help="maak een backup van een container")
-    b.add_argument("container", nargs="?", help="container ID of naam")
-    b.add_argument("-a", "--all", action="store_true", help="backup alle draaiende containers")
-    b.add_argument("-s", "--stopped", action="store_true", help="i.c.m. --all: ook gestopte containers meenemen")
-    b.add_argument("-t", "--tar", action="store_true", help="maak een .tar backup i.p.v. json + gekopieerde mounts")
-    b.add_argument("-o", "--output", default="./backups", help="root map voor backups (default: ./backups)")
-    b.add_argument("-l", "--launch", default=None, help="extern commando na backup; %%tag en %%list worden vervangen")
-    b.add_argument("-v", "--verbose", action="store_true", help="print gedetailleerde voortgang")
+    b = sub.add_parser("backup", help="create a backup of a container")
+    b.add_argument("container", nargs="?", help="container ID or name")
+    b.add_argument("-a", "--all", action="store_true", help="back up all running containers")
+    b.add_argument("-s", "--stopped", action="store_true", help="with --all: also include stopped containers")
+    b.add_argument("-t", "--tar", action="store_true", help="create a .tar backup instead of json + copied mounts")
+    b.add_argument("-o", "--output", default="./backups", help="root directory for backups (default: ./backups)")
+    b.add_argument("-l", "--launch", default=None, help="external command after backup; %%tag and %%list are substituted")
+    b.add_argument("-v", "--verbose", action="store_true", help="print detailed progress")
 
-    r = sub.add_parser("restore", help="herstel een backup")
-    r.add_argument("backup_file", help=".json of .tar backup-bestand")
-    r.add_argument("-s", "--start", action="store_true", help="start de container na herstel")
+    r = sub.add_parser("restore", help="restore a backup")
+    r.add_argument("backup_file", help=".json or .tar backup file")
+    r.add_argument("-s", "--start", action="store_true", help="start the container after restoring")
 
     args = parser.parse_args()
 
@@ -337,12 +352,19 @@ def main():
                 ps_cmd.append("-a")
             ids = [i for i in run(ps_cmd).splitlines() if i]
             for cid in ids:
-                do_backup(cid, args)
+                # Isolate failures per container so one problematic container
+                # (e.g. one with a docker.sock bind mount, permission issues,
+                # or any other unexpected error) doesn't abort the whole
+                # --all run.
+                try:
+                    do_backup(cid, args)
+                except Exception as e:
+                    print(f"Error backing up container {cid}: {e}", file=sys.stderr)
+                    continue
         else:
             if not args.container:
-                parser.error("geef een container ID/naam op, of gebruik --all")
+                parser.error("provide a container ID/name, or use --all")
             do_backup(args.container, args)
-
     elif args.command == "restore":
         do_restore(args.backup_file, args)
 
@@ -351,5 +373,5 @@ if __name__ == "__main__":
     try:
         main()
     except RuntimeError as e:
-        print(f"Fout: {e}", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
