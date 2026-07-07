@@ -14,3 +14,9 @@
 # Builds
 docker-backup
 /dist
+
+# Docker backup output
+backups/
+*.backup.json
+*.backup.files
+*.tar

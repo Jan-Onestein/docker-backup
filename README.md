@@ -45,7 +45,7 @@ and newer.
 
 ### From source
 
-    git clone https://github.com/muesli/docker-backup.git
+    git clone https://github.com/Jan-Onestein/docker-backup.git
     cd docker-backup
     go build
 

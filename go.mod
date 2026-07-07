@@ -1,4 +1,4 @@
-module github.com/muesli/docker-backup
+module github.com/Jan-Onestein/docker-backup
 
 go 1.23.0
 

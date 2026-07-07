@@ -4,15 +4,18 @@ import (
 	"archive/tar"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath" //
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
+	"github.com/docker/go-connections/nat"
 	"github.com/kennygrant/sanitize"
 	"github.com/spf13/cobra"
 )
@@ -20,11 +23,10 @@ import (
 // Backup is used to gather all of a container's metadata, so we can encode it
 // as JSON and store it
 type Backup struct {
-	Name            string
-	Config          *container.Config
-	HostConfig      *container.HostConfig
-	NetworkSettings *types.NetworkSettings
-	Platform        string
+	Name    string
+	Config  *container.Config
+	PortMap nat.PortMap
+	Mounts  []types.MountPoint
 }
 
 var (
@@ -33,6 +35,7 @@ var (
 	optAll     = false
 	optStopped = false
 	optVerbose = false
+	optOutput  = "./backups"   // 
 
 	paths []string
 	tw    *tar.Writer
@@ -53,14 +56,144 @@ var (
 	}
 )
 
-func backupTar(filename string, backup Backup) error {
+func collectFile(path string, info os.FileInfo, err error) error {
+	if err != nil {
+		return err
+	}
+
+	if optVerbose {
+		fmt.Println("Adding", path)
+	}
+
+	paths = append(paths, path)
+	return nil
+}
+
+func collectFileTar(path string, info os.FileInfo, err error) error {
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSocket != 0 {
+		// ignore sockets
+		return nil
+	}
+
+	if optVerbose {
+		fmt.Println("Adding", path)
+	}
+
+	th, err := tar.FileInfoHeader(info, path)
+	if err != nil {
+		return err
+	}
+
+	th.Name = path
+	if si, ok := info.Sys().(*syscall.Stat_t); ok {
+		th.Uid = int(si.Uid)
+		th.Gid = int(si.Gid)
+	}
+
+	if err := tw.WriteHeader(th); err != nil {
+		return err
+	}
+
+	if !info.Mode().IsRegular() {
+		return nil
+	}
+	if info.Mode().IsDir() {
+		return nil
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+
+	_, err = io.Copy(tw, file)
+	return err
+}
+
+// mountFolderName get subfoldername for a mount:
+// use the Docker volumename if availible (named volume),
+// else get the sanitized destination-path (bind mount).
+func mountFolderName(m types.MountPoint) string {
+	if m.Name != "" {
+		return sanitize.Path(m.Name)
+	}
+	name := strings.TrimPrefix(m.Destination, "/")
+	name = strings.Replace(name, "/", "_", -1)
+	return sanitize.Path(name)
+}
+
+// copyMount copy the entire content from src to dst,
+// including folderstructure, filerights and symlinks.
+func copyMount(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode())
+		}
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(linkTarget, target)
+		}
+
+		if !info.Mode().IsRegular() {
+			// sockets, devices e.d. overslaan
+			return nil
+		}
+
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			return err
+		}
+
+		in, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode())
+		if err != nil {
+			return err
+		}
+		defer out.Close()
+
+		if optVerbose {
+			fmt.Println("Copying", path, "->", target)
+		}
+
+		_, err = io.Copy(out, in)
+		return err
+	})
+}
+
+func backupTar(backupRoot, filename string, backup Backup) error {
 	b, err := json.MarshalIndent(backup, "", "  ")
 	if err != nil {
 		return err
 	}
 	// fmt.Println(string(b))
 
-	tarfile, err := os.Create(filename + ".tar")
+	if err := os.MkdirAll(backupRoot, 0755); err != nil {
+		return err
+	}
+
+	tarPath := filepath.Join(backupRoot, filename+".tar")
+	tarfile, err := os.Create(tarPath)
 	if err != nil {
 		return err
 	}
@@ -82,8 +215,17 @@ func backupTar(filename string, backup Backup) error {
 		return err
 	}
 
+	for _, m := range backup.Mounts {
+		// fmt.Printf("Mount (type %s) %s -> %s\n", m.Type, m.Source, m.Destination)
+
+		err := filepath.Walk(m.Source, collectFileTar)
+		if err != nil {
+			return err
+		}
+	}
+
 	tw.Close()
-	fmt.Println("Created backup:", filename+".tar")
+	fmt.Println("Created backup:", tarPath)
 	return nil
 }
 
@@ -94,7 +236,7 @@ func getFullImageName(imageName string) (string, error) {
 	}
 
 	// If the used image doesn't include tag information try to find one (if it exists).
-	images, err := cli.ImageList(ctx, image.ListOptions{})
+	images, err := cli.ImageList(ctx, types.ImageListOptions{})
 	if err != nil {
 		// Couldn't get image list, abort
 		return imageName, err
@@ -130,31 +272,32 @@ func backup(ID string) error {
 
 	paths = []string{}
 
-	// Add mount-path to filelist - start fix
-    for _, mount := range conf.Mounts {
-        if mount.Type == "bind" || mount.Type == "volume" {
-            paths = append(paths, mount.Source)
-        }
-    }
-    // end fix
-
 	conf.Config.Image, err = getFullImageName(conf.Config.Image)
 	if err != nil {
 		return err
 	}
 
 	backup := Backup{
-		Name:            conf.Name,
-		Config:          conf.Config,
-		HostConfig:      conf.HostConfig,
-		NetworkSettings: conf.NetworkSettings,
-		Platform:        conf.Platform,
+		Name:    conf.Name,
+		PortMap: conf.HostConfig.PortBindings,
+		Config:  conf.Config,
+		Mounts:  conf.Mounts,
 	}
 
 	filename := sanitize.Path(fmt.Sprintf("%s-%s", conf.Config.Image, ID))
 	filename = strings.Replace(filename, "/", "_", -1)
+
+	// Determine target folder: backups/<date_time>/<containername>
+	containerName := strings.TrimPrefix(conf.Name, "/")
+	timestamp := time.Now().Format("2006-01-02_15-04")
+	backupRoot := filepath.Join(optOutput, timestamp, containerName)
+
 	if optTar {
-		return backupTar(filename, backup)
+		return backupTar(backupRoot, filename, backup)
+	}
+
+	if err := os.MkdirAll(backupRoot, 0755); err != nil {
+		return err
 	}
 
 	b, err := json.MarshalIndent(backup, "", "  ")
@@ -163,21 +306,45 @@ func backup(ID string) error {
 	}
 	// fmt.Println(string(b))
 
-	err = ioutil.WriteFile(filename+".backup.json", b, 0600)
+	jsonPath := filepath.Join(backupRoot, filename+".backup.json")
+	err = ioutil.WriteFile(jsonPath, b, 0600)
 	if err != nil {
 		return err
 	}
 
-	filelist, err := os.Create(filename + ".backup.files")
+	for _, m := range conf.Mounts {
+		// fmt.Printf("Mount (type %s) %s -> %s\n", m.Type, m.Source, m.Destination)
+		err := filepath.Walk(m.Source, collectFile)
+		if err != nil {
+			return err
+		}
+
+		mountDir := filepath.Join(backupRoot, mountFolderName(m))
+		if err := os.MkdirAll(mountDir, 0755); err != nil {
+			return err
+		}
+		if err := copyMount(m.Source, mountDir); err != nil {
+			return err
+		}
+	}
+
+	filesPath := filepath.Join(backupRoot, filename+".backup.files")
+	filelist, err := os.Create(filesPath)
 	if err != nil {
 		return err
 	}
 	defer filelist.Close()
 
-	_, err = filelist.WriteString(filename + ".backup.json\n")
+	absJSONPath, err := filepath.Abs(jsonPath)
 	if err != nil {
 		return err
 	}
+
+	_, err = filelist.WriteString(absJSONPath + "\n")
+	if err != nil {
+		return err
+	}
+
 	for _, s := range paths {
 		_, err := filelist.WriteString(s + "\n")
 		if err != nil {
@@ -185,11 +352,11 @@ func backup(ID string) error {
 		}
 	}
 
-	fmt.Println("Created backup:", filename+".backup.json")
+	fmt.Println("Created backup:", jsonPath)
 
 	if optLaunch != "" {
 		ol := strings.Replace(optLaunch, "%tag", filename, -1)
-		ol = strings.Replace(ol, "%list", filename+".backup.files", -1)
+		ol = strings.Replace(ol, "%list", filesPath, -1)
 
 		fmt.Println("Launching external command and waiting for it to finish:")
 		fmt.Println(ol)
@@ -203,7 +370,7 @@ func backup(ID string) error {
 }
 
 func backupAll() error {
-	containers, err := cli.ContainerList(ctx, container.ListOptions{
+	containers, err := cli.ContainerList(ctx, types.ContainerListOptions{
 		All: optStopped,
 	})
 	if err != nil {
@@ -226,5 +393,6 @@ func init() {
 	backupCmd.Flags().BoolVarP(&optAll, "all", "a", false, "backup all running containers")
 	backupCmd.Flags().BoolVarP(&optStopped, "stopped", "s", false, "in combination with --all: also backup stopped containers")
 	backupCmd.Flags().BoolVarP(&optVerbose, "verbose", "v", false, "print detailed backup progress")
+	backupCmd.Flags().StringVarP(&optOutput, "output", "o", "./backups", "root folder for volume-mount backups")   //
 	RootCmd.AddCommand(backupCmd)
 }
